@@ -77,6 +77,25 @@
 
   .head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 
+  .prov {
+    appearance: none;
+    -webkit-appearance: none;
+    background: var(--bg, #141414);
+    color: var(--txt, #eee);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 11px;
+    padding: 5px 22px 5px 8px;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 7px center;
+  }
+  .prov:hover { border-color: rgba(255,255,255,0.3); }
+  .prov:focus-visible { outline: 2px solid var(--txt-dim, #888); outline-offset: 1px; }
+  .prov option { background: #141414; color: #eee; }
+
   .pill {
     font-size: 10px;
     font-weight: 600;
@@ -500,10 +519,14 @@
   <main class="widget" id="widget" aria-label="opencode go quota">
     <header class="head">
       <div class="brand">
-        <div class="brand-title">opencode go</div>
+        <div class="brand-title" id="brandTitle">opencode go</div>
         <div class="brand-sub" id="generated">reading quota…</div>
       </div>
       <div class="head-actions">
+        <select class="prov" id="provSel" aria-label="Provider">
+          <option value="opencode-go">opencode go</option>
+          <option value="openai">ChatGPT</option>
+        </select>
         <span class="pill" id="statusPill" data-state="loading">Syncing</span>
         <button class="refresh" id="refreshBtn" type="button" aria-label="Refresh now" title="Refresh now">
           <svg class="refresh-ring" aria-hidden="true" focusable="false" width="40" height="40" viewBox="0 0 40 40">
@@ -622,6 +645,36 @@
   var inflight = false;
   var RING_C = 116.24;         // circunferencia del anillo (r = 18.5)
   var ringEpoch = Date.now();  // última descarga: el anillo cuenta desde aquí
+
+  // ---- provider selector ----
+  var provSel = document.getElementById("provSel");
+  var brandTitle = document.getElementById("brandTitle");
+  var PROV_LABEL = { "opencode-go": "opencode go", "openai": "ChatGPT" };
+  var PROV_STORE = "quota.provider";
+
+  function currentProvider() {
+    return (provSel && provSel.value) || "opencode-go";
+  }
+
+  function rememberProvider(p) {
+    try { localStorage.setItem(PROV_STORE, p); } catch (e) { /* private mode */ }
+  }
+
+  function restoreProvider() {
+    var saved = null;
+    try { saved = localStorage.getItem(PROV_STORE); } catch (e) { /* ignore */ }
+    if (!saved) return;
+    var known = Array.prototype.some.call(provSel.options, function (o) {
+      return o.value === saved;
+    });
+    if (known) provSel.value = saved;
+  }
+
+  function syncBrand() {
+    var p = currentProvider();
+    if (brandTitle) brandTitle.textContent = PROV_LABEL[p] || p;
+    if (widget) widget.setAttribute("aria-label", (PROV_LABEL[p] || p) + " quota");
+  }
 
   var dtfDate = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
   var dtfShort = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit" });
@@ -961,7 +1014,7 @@
     if (inflight) return;
     inflight = true;
     refreshBtn.classList.add("spinning");
-    fetch("/quota.json", { cache: "no-store" })
+    fetch("/quota.json?provider=" + encodeURIComponent(currentProvider()), { cache: "no-store" })
       .then(function (res) {
         if (!res.ok) throw new Error("HTTP " + res.status);
         return res.json();
@@ -983,7 +1036,21 @@
 
   refreshBtn.addEventListener("click", fetchQuota);
 
+  if (provSel) {
+    provSel.addEventListener("change", function () {
+      rememberProvider(currentProvider());
+      syncBrand();
+      lastGood = null;      // no mezclar cifras de otro proveedor
+      lastGoodAt = 0;
+      dataState = "loading";
+      setStatus("loading");   // sin nota: ese hueco es la caja de error (roja)
+      fetchQuota();
+    });
+  }
+
   // First run + 60 s refresh + local 1 s clock.
+  restoreProvider();
+  syncBrand();
   fetchQuota();
   setInterval(fetchQuota, REFRESH_MS);
   setInterval(tick, 1000);

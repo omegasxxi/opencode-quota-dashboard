@@ -40,6 +40,7 @@ Design notes
   dashboard behaves the same whatever model the account uses.
 """
 import argparse
+import base64
 import ipaddress
 import json
 import os
@@ -49,6 +50,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -83,7 +85,8 @@ ROUTES = {
 }
 
 _lock = threading.Lock()
-_cache = {"ts": 0.0, "usage": None, "error": None}
+# One cache entry per provider: {provider: {ts, usage, error}}.
+_cache = {}
 
 
 # ------------------------------------------------------------------ key
@@ -162,6 +165,184 @@ def resolve_key():
                 return key, f"file {name}"
 
     return _from_openclaw()
+
+
+# --------------------------------------------------------------- adapters
+#
+# One entry per upstream. Every adapter returns (usage, error) where usage is
+# the same three-bucket shape the widget already understands:
+#   {"rolling": {status, percent, resetsAt}, "weekly": {...}, "monthly": {...}}
+# A bucket may be None; the widget prints "no data" for it rather than lying.
+
+# opencode-go stays the default, so an existing install is unaffected.
+PROVIDER = os.environ.get("QUOTA_PROVIDER", "opencode-go")
+
+CODEX_AUTH = os.environ.get("CODEX_AUTH_FILE",
+                            os.path.expanduser("~/.codex/auth.json"))
+OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+WHAM_URL = "https://chatgpt.com/backend-api/wham/usage"
+REFRESH_SKEW = 300          # refresh when this close to expiry, in seconds
+
+
+def _iso(epoch):
+    """Unix seconds -> the ISO-8601 'Z' form the widget parses."""
+    try:
+        return (datetime.fromtimestamp(float(epoch), timezone.utc)
+                .isoformat(timespec="seconds").replace("+00:00", "Z"))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _jwt_exp(token):
+    """Read 'exp' from a JWT without verifying it. None if unreadable."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except Exception:
+        return None
+
+
+def _load_codex_auth():
+    try:
+        with open(CODEX_AUTH, encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_codex_auth(st):
+    """Atomic write, mode 0600. Codex reads this same file, so a partial
+    write would log it out."""
+    tmp = CODEX_AUTH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CODEX_AUTH)
+
+
+def _refresh_codex(st):
+    """Swap the refresh token for a fresh access token. Returns error or None.
+
+    The refresh token can rotate: whatever comes back is persisted, otherwise
+    the next refresh would replay a dead token and Codex CLI would log out.
+    """
+    tokens = st.get("tokens") or {}
+    rt = tokens.get("refresh_token")
+    if not rt:
+        return "no refresh_token in %s" % CODEX_AUTH
+
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": rt,
+        "client_id": OAUTH_CLIENT_ID,
+        "scope": "openid profile email",
+    }).encode()
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=body, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": UA,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            out = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()[:120]
+        except Exception:
+            detail = ""
+        return "HTTP %s %s" % (e.code, detail)
+    except Exception as e:
+        return "%s: %s" % (type(e).__name__, e)
+
+    access = out.get("access_token")
+    if not access:
+        return "refresh response has no access_token"
+
+    tokens["access_token"] = access
+    if out.get("refresh_token"):
+        tokens["refresh_token"] = out["refresh_token"]
+    if out.get("id_token"):
+        tokens["id_token"] = out["id_token"]
+    st["tokens"] = tokens
+    st["last_refresh"] = (datetime.now(timezone.utc)
+                          .isoformat(timespec="seconds")
+                          .replace("+00:00", "Z"))
+    try:
+        _save_codex_auth(st)
+    except OSError as e:
+        return "could not persist refreshed token: %s" % e
+    return None
+
+
+def _window(w):
+    """Map one ChatGPT rate-limit window onto a widget bucket."""
+    if not isinstance(w, dict):
+        return None
+    pct = w.get("used_percent")
+    if pct is None:
+        return None
+    return {
+        "status": "ok",
+        "percent": round(float(pct), 2),
+        "resetsAt": _iso(w.get("reset_at")),
+    }
+
+
+def fetch_openai():
+    """ChatGPT / Codex plan usage.
+
+    This is the backend endpoint the Codex CLI itself reads, not a documented
+    public API, so it is the adapter most likely to break without notice.
+    The token is refreshed here instead of being left to expire.
+    """
+    st = _load_codex_auth()
+    if not st:
+        return None, "no Codex login at %s" % CODEX_AUTH
+
+    tokens = st.get("tokens") or {}
+    access = tokens.get("access_token")
+    if not access:
+        return None, "no access_token in %s" % CODEX_AUTH
+
+    exp = _jwt_exp(access)
+    if exp is not None and exp - time.time() < REFRESH_SKEW:
+        err = _refresh_codex(st)
+        if err:
+            return None, "token refresh failed: %s" % err
+        tokens = st.get("tokens") or {}
+        access = tokens.get("access_token") or access
+
+    headers = {
+        "Authorization": "Bearer " + access,
+        "Accept": "application/json",
+        "User-Agent": UA,
+    }
+    if tokens.get("account_id"):
+        headers["ChatGPT-Account-Id"] = str(tokens["account_id"])
+
+    req = urllib.request.Request(WHAM_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()[:120]
+        except Exception:
+            detail = ""
+        return None, "HTTP %s %s" % (e.code, detail)
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+    rl = body.get("rate_limit") or {}
+    return {
+        "rolling": _window(rl.get("primary_window")),
+        "weekly": _window(rl.get("secondary_window")),
+        # A ChatGPT plan exposes no monthly quota window, only credits.
+        "monthly": None,
+    }, None
 
 
 # ------------------------------------------------------------- projection
@@ -285,7 +466,7 @@ def projection(usage, st, now):
 
 # ----------------------------------------------------------------- fetch
 
-def fetch_usage():
+def fetch_opencode_go():
     """Return (usage, None) or (None, 'reason')."""
     key, _source = resolve_key()
     if not key:
@@ -311,33 +492,56 @@ def fetch_usage():
         return None, f"{type(e).__name__}: {e}"
 
 
-def current():
-    """Cache the last good reading; never break on a transient failure."""
+ADAPTERS = {
+    "opencode-go": fetch_opencode_go,
+    "openai": fetch_openai,
+}
+
+
+def fetch_usage(provider=None):
+    """Dispatch to the adapter for `provider` (default: QUOTA_PROVIDER)."""
+    adapter = ADAPTERS.get(provider or PROVIDER)
+    if not adapter:
+        return None, "unknown provider %r" % (provider or PROVIDER)
+    return adapter()
+
+
+def current(provider=None):
+    """Cache the last good reading per provider.
+
+    A provider that fails keeps its week-old-good reading and reports the
+    error, rather than blanking the other providers on the same page.
+    """
+    provider = provider or PROVIDER
     now = time.time()
     with _lock:
-        if _cache["usage"] is not None and (now - _cache["ts"]) < CACHE_TTL:
-            return _payload(now)
+        c = _cache.setdefault(provider, {"ts": 0.0, "usage": None, "error": None})
+        if c["usage"] is not None and (now - c["ts"]) < CACHE_TTL:
+            return _payload(now, provider)
 
-        usage, err = fetch_usage()
+        usage, err = fetch_usage(provider)
         if usage is not None:
-            _cache.update(ts=now, usage=usage, error=None)
+            c.update(ts=now, usage=usage, error=None)
             record_sample(usage, now)
         else:
-            _cache["error"] = err  # keep the last good reading if we have one
-        return _payload(now)
+            c["error"] = err  # keep the last good reading if we have one
+        return _payload(now, provider)
 
 
-def _payload(now):
-    age = int(now - _cache["ts"]) if _cache["usage"] is not None else None
+def _payload(now, provider=None):
+    provider = provider or PROVIDER
+    c = _cache.get(provider) or {"ts": 0.0, "usage": None, "error": "not fetched"}
+    age = int(now - c["ts"]) if c["usage"] is not None else None
     utc_now = datetime.now(timezone.utc)
     return {
-        "ok": _cache["usage"] is not None and _cache["error"] is None,
+        "ok": c["usage"] is not None and c["error"] is None,
+        "provider": provider,
         "generated": utc_now.isoformat(timespec="seconds"),
         "age_s": age,
-        "stale": _cache["usage"] is None or age is None or age > STALE_AFTER,
-        "error": _cache["error"],
-        "usage": _cache["usage"],
-        "projection": projection(_cache["usage"], _load_state(), utc_now),
+        "stale": c["usage"] is None or age is None or age > STALE_AFTER,
+        "error": c["error"],
+        "usage": c["usage"],
+        "projection": projection(c["usage"], _load_state(), utc_now),
     }
 
 
@@ -366,16 +570,24 @@ class Handler(BaseHTTPRequestHandler):
                    "application/json; charset=utf-8")
 
     def do_GET(self):
-        path = self.path.split("?")[0]
-        if path == "/quota.json":
-            self._json(200, current())
+        raw = self.path.split("?")[0]
+        query = urllib.parse.urlparse(self.path).query
+        q = urllib.parse.parse_qs(query)
+        provider = (q.get("provider") or [PROVIDER])[0]
+
+        if raw == "/quota.json":
+            self._json(200, current(provider))
             return
-        if path == "/healthz":
-            p = current()
-            self._json(200, {k: p[k] for k in ("ok", "age_s", "stale", "error")})
+        if raw == "/providers.json":
+            self._json(200, {"providers": list(ADAPTERS), "default": PROVIDER})
+            return
+        if raw == "/healthz":
+            p = current(provider)
+            self._json(200, {k: p[k] for k in ("ok", "provider", "age_s",
+                                               "stale", "error")})
             return
 
-        name = ROUTES.get(path)
+        name = ROUTES.get(raw)
         if not name:
             self._send(404, "not found", "text/plain; charset=utf-8")
             return
